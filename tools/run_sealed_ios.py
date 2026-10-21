@@ -151,13 +151,19 @@ def security_default(env):
 
 def security_state(env):return {'default':security_default(env),'search':security_list(env)}
 
-def restore_security_state(state,env):
+def restore_security_state(state,env,*,defer_absent=False):
  good=True
- for args in [['default-keychain','-d','user','-s',*([state['default']] if state['default'] is not None else [])],['list-keychains','-d','user','-s',*state['search']]]:
+ # Apple's pathless default setter resolves the CURRENT default; it cannot unset.
+ # An originally absent default is proved only after deleting our owned keychains.
+ commands=([['default-keychain','-d','user','-s',state['default']]] if state['default'] is not None else [])
+ commands.append(['list-keychains','-d','user','-s',*state['search']])
+ for args in commands:
   try:
    p=subprocess.run(['/usr/bin/security',*args],env=env,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(p.returncode==0)
   except BaseException:good=False
- try:need(security_state(env)==state)
+ try:
+  actual=security_state(env)
+  need(actual['search']==state['search'] if defer_absent and state['default'] is None else actual==state)
  except BaseException:good=False
  return good
 
@@ -181,7 +187,7 @@ def emergency_signing_cleanup(private,original_state,env,cms=None):
  good=True
  cms=cms or {};childenv=cms.get('environment',env)
  # Workers are already quiescent. Restore before deleting any default keychain.
- if cms.get('attempted') and not restore_security_state(cms['before'],childenv):good=False
+ if cms.get('attempted') and not restore_security_state(cms['before'],childenv,defer_absent=True):good=False
  for p in (private/'build-temp').glob('rouhi-testflight-*/signing.keychain-db'):
   try:
    no_links(p,private);need(p.parent.parent==private/'build-temp' and p.parent.name.startswith('rouhi-testflight-'))

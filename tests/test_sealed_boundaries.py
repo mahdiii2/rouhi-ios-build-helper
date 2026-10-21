@@ -66,7 +66,11 @@ class SyntheticSecurity:
    key='search' if verb=='list-keychains' else 'default'
    if '-s' in args:
     values=args[args.index('-s')+1:]
-    if self.ignore is None or not self.ignore(args,env):state[key]=values if key=='search' else (values[0] if values else None)
+    # SecKeychainSetDomainDefault calls Keychain::optional(NULL): current default,
+    # not absence. Reproduce that Apple behavior rather than inventing an unset.
+    if key=='default' and not values:
+     return subprocess.CompletedProcess(args,0 if state[key] is not None else 1,b'',b'')
+    if self.ignore is None or not self.ignore(args,env):state[key]=values if key=='search' else values[0]
     out=b''
    else:
     values=state[key] if key=='search' else ([] if state[key] is None else [state[key]])
@@ -309,8 +313,46 @@ class SealedBoundaryTests(unittest.TestCase):
   private,env,model=self.security_fixture();cms={}
   with patch.object(controller.subprocess,'run',side_effect=model):
    original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms)
-   model.fail=lambda args,e:args[1:5]==['default-keychain','-d','user','-s'] and len(args)==5
+   model.fail=lambda args,e:args[1:5]==['default-keychain','-d','user','-s'] and e.get('HOME')!=model.home
    self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+ def test_cms_roundtrip_checks_real_darwin_before_any_sealed_input(self):
+  private,env,model=self.security_fixture();cms={}
+  normal=controller.clean_public_environment(gh());env=normal|{'HOME':str(private/'home')}
+  # The production Mac tests the actual OS protocol before input download/decrypt.
+  # Windows exercises the same body against explicit synthetic Apple semantics.
+  manager=contextlib.nullcontext() if sys.platform=='darwin' else patch.object(controller.subprocess,'run',side_effect=model)
+  with manager:
+   original=controller.security_state(normal);before=controller.security_state(env)
+   try:
+    controller.prepare_cms_keychain(private,env,cms)
+    self.assertEqual(controller.security_default(env),str(private/'home/cms-bootstrap.keychain-db'))
+   finally:
+    self.assertTrue(controller.emergency_signing_cleanup(private,original,normal,cms))
+   self.assertEqual(controller.security_state(normal),original);self.assertEqual(controller.security_state(env),before)
+  self.assertFalse((private/'home/cms-bootstrap.keychain-db').exists())
+ def test_pathless_apple_default_setter_does_not_unset_current_default(self):
+  private,env,model=self.security_fixture();cms={}
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms)
+   result=model(['/usr/bin/security','default-keychain','-d','user','-s'],env=env)
+   self.assertEqual(result.returncode,0);self.assertEqual(controller.security_default(env),cms['path'])
+   self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms))
+ def test_absent_default_is_proved_after_owned_deletion_without_empty_setter(self):
+  private,env,model=self.security_fixture();cms={}
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms)
+   self.assertIsNone(cms['before']['default'])
+   self.assertFalse(controller.restore_security_state(cms['before'],env))
+   self.assertTrue(controller.restore_security_state(cms['before'],env,defer_absent=True))
+   self.assertEqual(controller.security_default(env),cms['path'])
+   self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms));self.assertEqual(controller.security_state(env),cms['before'])
+  self.assertFalse(any(c[1:5]==['default-keychain','-d','user','-s'] and len(c)==5 for c in model.calls))
+ def test_unowned_default_is_neither_deleted_nor_claimed_restored(self):
+  private,env,model=self.security_fixture();cms={};foreign=self.path('foreign.keychain-db');foreign.write_bytes(b'KEEP-FOREIGN')
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms);model.child['default']=str(foreign)
+   self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+  self.assertEqual(foreign.read_bytes(),b'KEEP-FOREIGN');self.assertFalse(any(c[1]=='delete-keychain' and c[-1]==str(foreign) for c in model.calls))
  def test_failed_bootstrap_deletion_never_claims_private_cleanup(self):
   private,env,model=self.security_fixture();cms={}
   with patch.object(controller.subprocess,'run',side_effect=model):
@@ -364,7 +406,7 @@ class SealedBoundaryTests(unittest.TestCase):
   row={k:r[k] for k in ['cipher_sha256','source_sha','manifest_sha256','original_source_closure_sha256']};row.update(build_number='7',version='1.0',max_ciphertext_output_bytes=1024**2)
   e=gh();marker={'synthetic':'owned'};controller.private_json(work/'owner.json',marker);policy={'output_public_key_sha256':self.pubsha};public=io.StringIO()
   security=SyntheticSecurity(self.root,work/'private/home')
-  if not clean:security.fail=lambda args,env:args[1:5]==['default-keychain','-d','user','-s'] and len(args)==5
+  if not clean:security.fail=lambda args,env:args[1:5]==['default-keychain','-d','user','-s'] and env.get('HOME')!=security.home
   def in_process(args,env,cwd,log,**kwargs):
    self.assertEqual(security.state(env)['default'],str(work/'private/home/cms-bootstrap.keychain-db'))
    self.assertNotIn('RIDES_IOS_P12_PASSWORD',env)
