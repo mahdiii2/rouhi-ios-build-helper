@@ -68,6 +68,8 @@ class SyntheticSecurity:
     # Apple ignores failed preference-file writes when Library/Preferences is absent.
     if not persistent:return subprocess.CompletedProcess(args,0,b'',b'')
     values=args[args.index('-s')+1:]
+    # An empty Darwin list cannot exclude its still-present default.
+    if key=='search' and not values:return subprocess.CompletedProcess(args,0,b'',b'')
     # SecKeychainSetDomainDefault calls Keychain::optional(NULL): current default,
     # not absence. Reproduce that Apple behavior rather than inventing an unset.
     if key=='default' and not values:
@@ -319,6 +321,27 @@ class SealedBoundaryTests(unittest.TestCase):
    original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms)
    model.fail=lambda args,e:args[1:5]==['default-keychain','-d','user','-s'] and e.get('HOME')!=model.home
    self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+ def test_empty_search_setter_cannot_exclude_the_still_present_default(self):
+  private,env,model=self.security_fixture();cms={};original=copy.deepcopy(model.normal)
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   controller.prepare_cms_keychain(private,env,cms)
+   result=model(['/usr/bin/security','list-keychains','-d','user','-s'],env=env)
+   self.assertEqual(result.returncode,0);self.assertEqual(controller.security_list(env),[cms['path']])
+   self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms));self.assertEqual(controller.security_state(env),cms['before'])
+ def test_deferred_search_proof_still_rejects_a_final_foreign_entry(self):
+  private,env,model=self.security_fixture();cms={};foreign=self.path('foreign-search.keychain-db');foreign.write_bytes(b'KEEP-FOREIGN-SEARCH');original=copy.deepcopy(model.normal)
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   controller.prepare_cms_keychain(private,env,cms);model.child['search'].append(str(foreign))
+   self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+  self.assertEqual(foreign.read_bytes(),b'KEEP-FOREIGN-SEARCH')
+ def test_success_exit_without_owned_keychain_removal_never_claims_cleanup(self):
+  private,env,model=self.security_fixture();cms={};original=copy.deepcopy(model.normal)
+  def run(args,**kwargs):
+   if args[0]=='/usr/bin/security' and args[1]=='delete-keychain':return subprocess.CompletedProcess(args,0,b'',b'')
+   return model(args,**kwargs)
+  with patch.object(controller.subprocess,'run',side_effect=run):
+   controller.prepare_cms_keychain(private,env,cms);self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+  self.assertTrue((private/'home/cms-bootstrap.keychain-db').exists())
  def test_missing_preferences_parent_reproduces_successful_but_unpersisted_setter(self):
   private,env,model=self.security_fixture();target=str(private/'home/cms-bootstrap.keychain-db')
   result=model(['/usr/bin/security','default-keychain','-d','user','-s',target],env=env)

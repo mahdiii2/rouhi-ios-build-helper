@@ -152,6 +152,10 @@ def security_default(env):
 def security_state(env):return {'default':security_default(env),'search':security_list(env)}
 
 def restore_security_state(state,env,*,defer_absent=False):
+ # Empty search lists fall back to the still-present default on Darwin.
+ # SecKeychainDelete clears our owned default/list entry; the caller verifies
+ # BOTH full states after every owned deletion before claiming cleanup.
+ if defer_absent and state['default'] is None:return True
  good=True
  # Apple's pathless default setter resolves the CURRENT default; it cannot unset.
  # An originally absent default is proved only after deleting our owned keychains.
@@ -161,9 +165,9 @@ def restore_security_state(state,env,*,defer_absent=False):
   try:
    p=subprocess.run(['/usr/bin/security',*args],env=env,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(p.returncode==0)
   except BaseException:good=False
+ if defer_absent:return good
  try:
-  actual=security_state(env)
-  need(actual['search']==state['search'] if defer_absent and state['default'] is None else actual==state)
+  actual=security_state(env);need(actual==state)
  except BaseException:good=False
  return good
 
