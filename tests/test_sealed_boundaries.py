@@ -51,6 +51,40 @@ def secret(role='driver'):
  e={k:'synthetic-only' for k in snap.PRIVATE_KEYS};e.update(ASC_APP_ID={'driver':'6821815632','customer':'6821814203'}[role],RIDES_IOS_BUILD_NUMBER='7',RIDES_IOS_VERSION='1.0');return e
 def rows_for(root):
  return sorted([{'path':p.relative_to(root).as_posix(),'size':p.stat().st_size,'sha256':crypto.digest_file(p),'mode':0o755 if p.name=='gradlew' else 0o644} for p in root.rglob('*') if p.is_file()],key=lambda x:x['path'])
+class SyntheticSecurity:
+ """Models command state, not Apple cryptography; never touches real keychains."""
+ def __init__(self,root,private_home,shared=False):
+  self.real_run=subprocess.run;self.home=str(private_home);self.calls=[];self.fail=None;self.ignore=None;self.shared=shared
+  login=root/'original-login.keychain-db';login.write_bytes(b'KEEP-ORIGINAL-PUBLIC-SYNTHETIC')
+  self.normal={'default':str(login),'search':[str(login)]};self.child=self.normal if shared else {'default':None,'search':[]}
+ def state(self,env):return self.child if env.get('HOME')==self.home else self.normal
+ def __call__(self,args,**kw):
+  if args[0]!='/usr/bin/security':return self.real_run(args,**kw)
+  self.calls.append(args.copy());env=kw['env'];state=self.state(env);verb=args[1]
+  if self.fail is not None and self.fail(args,env):return subprocess.CompletedProcess(args,1,b'',b'synthetic-security-failure')
+  if verb in {'list-keychains','default-keychain'}:
+   key='search' if verb=='list-keychains' else 'default'
+   if '-s' in args:
+    values=args[args.index('-s')+1:]
+    if self.ignore is None or not self.ignore(args,env):state[key]=values if key=='search' else (values[0] if values else None)
+    out=b''
+   else:
+    values=state[key] if key=='search' else ([] if state[key] is None else [state[key]])
+    out=('    <NULL>\n' if key=='default' and state[key] is None else ''.join('    "'+x+'"\n' for x in values)).encode()
+  elif verb=='create-keychain':
+   target=Path(args[-1]);target.write_bytes(b'SYNTHETIC-PUBLIC-CMS-CERTS-ONLY');state['search'].append(str(target))
+   if state['default'] is None:state['default']=str(target)
+   out=b''
+  elif verb=='unlock-keychain':out=b''
+  elif verb=='delete-keychain':
+   target=Path(args[-1]);target.unlink()
+   for context in [self.child,self.normal]:
+    context['search']=[x for x in context['search'] if x!=str(target)]
+    if context['default']==str(target):context['default']=None
+   out=b''
+  else:raise AssertionError('Unlisted synthetic Security command')
+  return subprocess.CompletedProcess(args,0,out,b'')
+
 class SealedBoundaryTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
@@ -221,9 +255,78 @@ class SealedBoundaryTests(unittest.TestCase):
     with patch.object(controller.signal,'SIGKILL',9,create=True),patch.object(controller.os,'name','posix'),patch.object(controller.os,'killpg',create=True,side_effect=killpg),patch.object(controller.time,'monotonic',side_effect=iter(range(0,256,16))),patch.object(controller.time,'sleep'):
      controller.stop_process(p)
     self.assertTrue(state['reaped']);self.assertIn(exiting_signal,calls);p.wait.assert_called_once()
+ def security_fixture(self,shared=False):
+  private=self.path('private');(private/'home').mkdir(parents=True);(private/'build-temp').mkdir()
+  env={'HOME':str(private/'home'),'PATH':'synthetic'};model=SyntheticSecurity(self.root,private/'home',shared)
+  return private,env,model
+ def test_default_keychain_absence_accepts_only_recognized_apple_response(self):
+  for out,err,code,accepted in [(b'',b'security: SecKeychainCopyDomainDefault user: A default keychain could not be found.\n',1,True),(b' <NULL>\n',b'',0,True),(b'',b'synthetic-unknown-security-error',1,False),(b' /relative/not-quoted\n',b'',1,False)]:
+   with self.subTest(response=(out,err,code)),patch.object(controller.subprocess,'run',return_value=subprocess.CompletedProcess([],code,out,err)):
+    if accepted:self.assertIsNone(controller.security_default({}))
+    else:
+     with self.assertRaises(ValueError):controller.security_default({})
+ def test_default_keychain_relative_or_ambiguous_path_is_rejected(self):
+  for out in [b'"relative/path"',b'"C:/one" "C:/two"',b'"relative\npath"']:
+   with self.subTest(response=out),patch.object(controller.subprocess,'run',return_value=subprocess.CompletedProcess([],0,out,b'')):
+    with self.assertRaises(ValueError):controller.security_default({})
+ def test_private_cms_bootstrap_and_original_state_restore_in_both_domain_models(self):
+  for shared in [False,True]:
+   with self.subTest(shared=shared):
+    case=self.root/str(shared);case.mkdir();private=case/'private';(private/'home').mkdir(parents=True);(private/'build-temp').mkdir();env={'HOME':str(private/'home')};model=SyntheticSecurity(case,private/'home',shared);cms={}
+    with patch.object(controller.subprocess,'run',side_effect=model):
+     original=controller.security_state({});child=controller.security_state(env);controller.prepare_cms_keychain(private,env,cms)
+     self.assertEqual(controller.security_default(env),str(private/'home/cms-bootstrap.keychain-db'))
+     self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms));self.assertEqual(controller.security_state({}),original);self.assertEqual(controller.security_state(env),child)
+    self.assertFalse((private/'home/cms-bootstrap.keychain-db').exists());self.assertEqual((case/'original-login.keychain-db').read_bytes(),b'KEEP-ORIGINAL-PUBLIC-SYNTHETIC')
+ def test_preexisting_bootstrap_is_preserved_without_security_mutation(self):
+  private,env,model=self.security_fixture();keychain=private/'home/cms-bootstrap.keychain-db';keychain.write_bytes(b'KEEP-EXISTING');cms={}
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   with self.assertRaises(ValueError):controller.prepare_cms_keychain(private,env,cms)
+  self.assertFalse(model.calls);self.assertEqual(keychain.read_bytes(),b'KEEP-EXISTING');self.assertFalse(cms)
+ def test_bootstrap_snapshot_failure_precedes_any_mutation(self):
+  private,env,model=self.security_fixture();cms={};model.fail=lambda args,e:True
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   with self.assertRaises(ValueError):controller.prepare_cms_keychain(private,env,cms)
+  self.assertFalse(cms);self.assertFalse(any(c[1]=='create-keychain' for c in model.calls))
+ def test_partial_bootstrap_failure_restores_state_and_deletes_only_owned_file(self):
+  for failed in ['create-keychain','unlock-keychain','default-keychain','list-keychains']:
+   with self.subTest(failed=failed):
+    case=self.root/failed;case.mkdir();private=case/'private';(private/'home').mkdir(parents=True);(private/'build-temp').mkdir();env={'HOME':str(private/'home')};model=SyntheticSecurity(case,private/'home');cms={}
+    with patch.object(controller.subprocess,'run',side_effect=model):
+     original=controller.security_state({});before=controller.security_state(env)
+     model.fail=lambda args,e:args[1]==failed and (failed not in {'default-keychain','list-keychains'} or '-s' in args)
+     with self.assertRaises(ValueError):controller.prepare_cms_keychain(private,env,cms)
+     model.fail=None;self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms));self.assertEqual(controller.security_state(env),before)
+    self.assertEqual((case/'original-login.keychain-db').read_bytes(),b'KEEP-ORIGINAL-PUBLIC-SYNTHETIC')
+ def test_default_bootstrap_readback_mismatch_stops_before_native_worker(self):
+  private,env,model=self.security_fixture();cms={};model.ignore=lambda args,e:args[1]=='default-keychain' and '-s' in args
+  # An existing private-HOME default ensures ignored assignment is observable.
+  model.child['default']=model.normal['default'];original=copy.deepcopy(model.normal)
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   with self.assertRaises(ValueError):controller.prepare_cms_keychain(private,env,cms)
+   model.ignore=None;self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms))
+ def test_failed_default_restore_never_claims_private_cleanup(self):
+  private,env,model=self.security_fixture();cms={}
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms)
+   model.fail=lambda args,e:args[1:5]==['default-keychain','-d','user','-s'] and len(args)==5
+   self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+ def test_failed_bootstrap_deletion_never_claims_private_cleanup(self):
+  private,env,model=self.security_fixture();cms={}
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms);model.fail=lambda args,e:args[1]=='delete-keychain'
+   self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+  self.assertTrue((private/'home/cms-bootstrap.keychain-db').exists())
+ def test_cleanup_restores_original_after_owned_signing_file_deletion(self):
+  private,env,model=self.security_fixture();cms={};signing=private/'build-temp/rouhi-testflight-synthetic/signing.keychain-db';signing.parent.mkdir();signing.write_bytes(b'SYNTHETIC')
+  unrelated=self.path('unrelated.keychain-db');unrelated.write_bytes(b'KEEP-UNRELATED')
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms);model.child['search'].insert(0,str(signing));self.assertTrue(controller.emergency_signing_cleanup(private,original,{},cms))
+  self.assertFalse(signing.exists());self.assertEqual(unrelated.read_bytes(),b'KEEP-UNRELATED')
+  deletions=[c[-1] for c in model.calls if c[1]=='delete-keychain'];self.assertEqual(set(deletions),{str(signing),str(private/'home/cms-bootstrap.keychain-db')})
  def test_security_restore_failure_is_not_claimed_clean(self):
   private=self.path('private');(private/'build-temp').mkdir(parents=True)
-  with patch.object(controller.subprocess,'run',side_effect=OSError('synthetic-security-failure')):self.assertFalse(controller.emergency_signing_cleanup(private,[],{}))
+  with patch.object(controller.subprocess,'run',side_effect=OSError('synthetic-security-failure')):self.assertFalse(controller.emergency_signing_cleanup(private,{'default':None,'search':[]},{}))
  def test_cleanup_rejects_a_sibling_instead_of_private_owned_root(self):
   sibling=self.path('valuable');sibling.mkdir();(sibling/'keep').write_bytes(b'keep')
   with self.assertRaises(ValueError):controller.remove_owned_tree(sibling,self.root)
@@ -249,7 +352,7 @@ class SealedBoundaryTests(unittest.TestCase):
   out,key,r,raw=self.fixture();helper=self.path('helper');helper.mkdir();(helper/'owner-output-public.pem').write_bytes(self.public);work=self.path('work');work.mkdir(mode=0o700);shutil.copyfile(out/'input.sealed',work/'input.sealed');marker={'synthetic':'owned'};controller.private_json(work/'owner.json',marker)
   row={k:r[k] for k in ['cipher_sha256','source_sha','manifest_sha256','original_source_closure_sha256']};row.update(build_number='7',version='1.0',max_ciphertext_output_bytes=1024**2)
   def unconfirmed(*args,**kwargs):kwargs['process_state'].update(started=True,quiescent=False);raise controller.ProcessGroupStillAlive()
-  with patch.dict(adapter.BASELINES,{'driver':hashlib.sha256(raw).hexdigest()}),patch.dict(os.environ,{'SEALED_INPUT_PASSPHRASE':base64.b64encode(key).decode()}),patch.object(controller,'security_list',return_value=[]),patch.object(controller,'emergency_signing_cleanup') as cleanup,patch.object(controller,'bounded_process',side_effect=unconfirmed):
+  with patch.dict(adapter.BASELINES,{'driver':hashlib.sha256(raw).hexdigest()}),patch.dict(os.environ,{'SEALED_INPUT_PASSPHRASE':base64.b64encode(key).decode()}),patch.object(controller,'security_state',return_value={'default':None,'search':[]}),patch.object(controller,'prepare_cms_keychain'),patch.object(controller,'emergency_signing_cleanup') as cleanup,patch.object(controller,'bounded_process',side_effect=unconfirmed):
    with self.assertRaises(ValueError):controller.build_and_seal(helper,gh(),self.git,{'output_public_key_sha256':self.pubsha},'driver',row,work,marker)
    cleanup.assert_not_called()
   self.assertTrue((work/'private').exists());self.assertFalse((helper/'sealed-output').exists())
@@ -260,9 +363,13 @@ class SealedBoundaryTests(unittest.TestCase):
   out,key,r,raw=self.fixture(fail=fail);helper=self.path('helper');helper.mkdir();(helper/'owner-output-public.pem').write_bytes(self.public);work=self.path('work');work.mkdir(mode=0o700);shutil.copyfile(out/'input.sealed',work/'input.sealed')
   row={k:r[k] for k in ['cipher_sha256','source_sha','manifest_sha256','original_source_closure_sha256']};row.update(build_number='7',version='1.0',max_ciphertext_output_bytes=1024**2)
   e=gh();marker={'synthetic':'owned'};controller.private_json(work/'owner.json',marker);policy={'output_public_key_sha256':self.pubsha};public=io.StringIO()
+  security=SyntheticSecurity(self.root,work/'private/home')
+  if not clean:security.fail=lambda args,env:args[1:5]==['default-keychain','-d','user','-s'] and len(args)==5
   def in_process(args,env,cwd,log,**kwargs):
+   self.assertEqual(security.state(env)['default'],str(work/'private/home/cms-bootstrap.keychain-db'))
+   self.assertNotIn('RIDES_IOS_P12_PASSWORD',env)
    with Path(log).open('w') as f,patch.dict(os.environ,env,clear=True),contextlib.redirect_stdout(f),contextlib.redirect_stderr(f):return controller.native_worker(args[-1])
-  with patch.dict(adapter.BASELINES,{'driver':hashlib.sha256(raw).hexdigest()}),patch.dict(os.environ,{'SEALED_INPUT_PASSPHRASE':base64.b64encode(key).decode()}),patch.object(controller,'security_list',return_value=[]),patch.object(controller,'emergency_signing_cleanup',return_value=clean),patch.object(controller,'bounded_process',side_effect=in_process),contextlib.redirect_stdout(public):
+  with patch.dict(adapter.BASELINES,{'driver':hashlib.sha256(raw).hexdigest()}),patch.dict(os.environ,{'SEALED_INPUT_PASSPHRASE':base64.b64encode(key).decode()}),patch.object(controller.subprocess,'run',side_effect=security),patch.object(controller,'bounded_process',side_effect=in_process),contextlib.redirect_stdout(public):
    if clean:status=controller.build_and_seal(helper,e,self.git,policy,'driver',row,work,marker)
    else:
     with self.assertRaises(ValueError):controller.build_and_seal(helper,e,self.git,policy,'driver',row,work,marker)

@@ -141,19 +141,64 @@ def bounded_process(args,env,cwd,log,*,timeout=WORKER_SECONDS,extra_logs=None,pr
 def security_list(env):
  p=subprocess.run(['/usr/bin/security','list-keychains','-d','user'],env=env,capture_output=True,timeout=30);need(p.returncode==0 and len(p.stdout)<=65536)
  rows=shlex.split(p.stdout.decode());need(len(rows)<=32 and all(Path(x).is_absolute() and '\n' not in x and '\r' not in x for x in rows));return rows
-def emergency_signing_cleanup(private,search_list,env):
- """Only keys/profiles beneath private HOME/temp can have been installed."""
- if search_list is None:return True
+def security_default(env):
+ p=subprocess.run(['/usr/bin/security','default-keychain','-d','user'],env=env,capture_output=True,stdin=subprocess.DEVNULL,timeout=30)
+ need(len(p.stdout)<=65536 and len(p.stderr)<=65536)
+ if p.returncode==1 and not p.stdout.strip() and re.fullmatch(r'(?:security: )?SecKeychainCopyDomainDefault user: A default keychain could not be found\.',p.stderr.decode().strip()):return None
+ need(p.returncode==0)
+ if p.stdout.strip()==b'<NULL>':return None
+ rows=shlex.split(p.stdout.decode());need(len(rows)==1 and Path(rows[0]).is_absolute() and '\n' not in rows[0] and '\r' not in rows[0]);return rows[0]
+
+def security_state(env):return {'default':security_default(env),'search':security_list(env)}
+
+def restore_security_state(state,env):
  good=True
- try:
-  p=subprocess.run(['/usr/bin/security','list-keychains','-d','user','-s',*search_list],env=env,capture_output=True,timeout=30);need(p.returncode==0)
+ for args in [['default-keychain','-d','user','-s',*([state['default']] if state['default'] is not None else [])],['list-keychains','-d','user','-s',*state['search']]]:
+  try:
+   p=subprocess.run(['/usr/bin/security',*args],env=env,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(p.returncode==0)
+  except BaseException:good=False
+ try:need(security_state(env)==state)
  except BaseException:good=False
+ return good
+
+def prepare_cms_keychain(private,env,state):
+ """Give unchanged CMS verification a private default for public signer certs."""
+ home=private/'home';no_links(home,private);need(home.is_dir() and env['HOME']==str(home))
+ keychain=home/'cms-bootstrap.keychain-db';no_links(keychain,private);need(not keychain.exists() and not state)
+ # Capture before create: Security may make the first keychain default itself.
+ state.update(before=security_state(env),environment=env.copy(),path=str(keychain),attempted=True)
+ password=base64.b64encode(os.urandom(32)).decode()
+ try:
+  for args in [['create-keychain','-p',password,str(keychain)],['unlock-keychain','-p',password,str(keychain)],['default-keychain','-d','user','-s',str(keychain)],['list-keychains','-d','user','-s',str(keychain),*state['before']['search']]]:
+   p=subprocess.run(['/usr/bin/security',*args],env=env,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(p.returncode==0)
+  no_links(keychain,private);need(keychain.is_file())
+  need(security_state(env)=={'default':str(keychain),'search':[str(keychain),*state['before']['search']]})
+ finally:password=None
+
+def emergency_signing_cleanup(private,original_state,env,cms=None):
+ """Only keys/profiles beneath private HOME/temp can have been installed."""
+ if original_state is None:return True
+ good=True
+ cms=cms or {};childenv=cms.get('environment',env)
+ # Workers are already quiescent. Restore before deleting any default keychain.
+ if cms.get('attempted') and not restore_security_state(cms['before'],childenv):good=False
  for p in (private/'build-temp').glob('rouhi-testflight-*/signing.keychain-db'):
   try:
    no_links(p,private);need(p.parent.parent==private/'build-temp' and p.parent.name.startswith('rouhi-testflight-'))
-   result=subprocess.run(['/usr/bin/security','delete-keychain',str(p)],env=env,capture_output=True,timeout=30);need(result.returncode==0)
+   result=subprocess.run(['/usr/bin/security','delete-keychain',str(p)],env=childenv,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(result.returncode==0 and not p.exists())
+  except BaseException:good=False
+ if cms.get('attempted'):
+  try:
+   p=Path(cms['path']);need(p==private/'home/cms-bootstrap.keychain-db');no_links(p,private)
+   if p.exists():
+    result=subprocess.run(['/usr/bin/security','delete-keychain',str(p)],env=childenv,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(result.returncode==0 and not p.exists())
+  except BaseException:good=False
+ if not restore_security_state(original_state,env):good=False
+ if cms.get('attempted'):
+  try:need(security_state(childenv)==cms['before'])
   except BaseException:good=False
  return good
+
 def remove_owned_tree(path,root):
  path=Path(path);root=Path(root);need(path.parent==root and path.name=='private');no_links(path,root)
  # Check all paths before deletion; source build output links are unlinked by
@@ -202,7 +247,7 @@ def build_and_seal(helper,e,git,policy,role,row,work,marker):
  verify_work(work,marker);need(digest_file(work/'input.sealed')==row['cipher_sha256']);private_json(work/'build-started.json',{'started':True})
  key_text=os.environ.pop('SEALED_INPUT_PASSPHRASE','');key=base64.b64decode(key_text,validate=True);del key_text;need(len(key)==32)
  public_path=helper/'owner-output-public.pem';no_links(public_path,helper);public=public_path.read_bytes();need(hashlib.sha256(public).hexdigest()==policy['output_public_key_sha256'])
- private=work/'private';private.mkdir(mode=0o700);search=None;native=False;signing_clean=False;cipher=None;error='native_not_started';process_state={'started':False,'quiescent':True}
+ private=work/'private';private.mkdir(mode=0o700);search=None;cms={};native=False;signing_clean=False;cipher=None;error='native_not_started';process_state={'started':False,'quiescent':True}
  pubenv=clean_public_environment(e);pubenv.pop('RUNNER_TEMP',None)
  try:
   payload_context={'role':role,'source_sha':row['source_sha'],'manifest_sha256':row['manifest_sha256']}
@@ -214,7 +259,7 @@ def build_and_seal(helper,e,git,policy,role,row,work,marker):
   verify_source(unpacked/'source',m['files'],allow_git=True)
   childenv=pubenv|{'HOME':str(private/'home'),'RUNNER_TEMP':str(private/'build-temp'),'TMPDIR':str(private/'build-temp'),'PYTHONDONTWRITEBYTECODE':'1','GRADLE_USER_HOME':str(private/'home/.gradle'),'KONAN_DATA_DIR':str(private/'home/.konan'),'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':os.devnull,'GIT_TERMINAL_PROMPT':'0'}
   buildenv=childenv|secret|{'RIDES_IOS_CONTEXT':'sealed-helper-v2','RIDES_IOS_UPLOAD':'false','RIDES_IOS_SOURCE_SHA':row['source_sha'],'SEALED_REVIEWED_HELPER_SHA':e['GITHUB_SHA'],'SEALED_REVIEWED_SOURCE_SHA':row['source_sha'],'SEALED_REVIEWED_MANIFEST_SHA256':row['manifest_sha256'],'SEALED_REVIEWED_ROLE':role}
-  secret.clear();search=security_list(pubenv)
+  secret.clear();search=security_state(pubenv);prepare_cms_keychain(private,childenv,cms)
   private_json(private/'worker-config.json',{'private':str(private),'environment':buildenv});buildenv.clear()
   status=bounded_process([sys.executable,'-B',str(Path(__file__)),'worker',str(private/'worker-config.json')],childenv,unpacked/'source',private/'worker.log',extra_logs=private/'build-temp',process_state=process_state)
   result=read_json(private/'worker-result.json');need(set(result)=={'schema','native_succeeded','category','native_cleanup'} and result['schema']==2)
@@ -227,7 +272,7 @@ def build_and_seal(helper,e,git,policy,role,row,work,marker):
   # On uncertain child lifetime preserve the exact private directory for the
   # disposable VM; never remove keys or claim/publish cleanup completion.
   need(process_state['quiescent'],'owned_process_group_not_quiescent')
-  signing_clean=emergency_signing_cleanup(private,search,pubenv)
+  signing_clean=emergency_signing_cleanup(private,search,pubenv,cms)
   try:
    private_json(private/'controller-result.json',{'schema':2,'native_build_succeeded':native,'native_failure_category':error,'outer_signing_cleanup_verified':signing_clean,'public_upload':False,'testflight_processing':False,'device_verified':False,'full_attestation':False})
    archive=private/'output.tar'
