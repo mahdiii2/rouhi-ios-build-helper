@@ -60,11 +60,13 @@ class SyntheticSecurity:
  def state(self,env):return self.child if env.get('HOME')==self.home else self.normal
  def __call__(self,args,**kw):
   if args[0]!='/usr/bin/security':return self.real_run(args,**kw)
-  self.calls.append(args.copy());env=kw['env'];state=self.state(env);verb=args[1]
+  self.calls.append(args.copy());env=kw['env'];state=self.state(env);verb=args[1];persistent=env.get('HOME')!=self.home or (Path(self.home)/'Library/Preferences').is_dir()
   if self.fail is not None and self.fail(args,env):return subprocess.CompletedProcess(args,1,b'',b'synthetic-security-failure')
   if verb in {'list-keychains','default-keychain'}:
    key='search' if verb=='list-keychains' else 'default'
    if '-s' in args:
+    # Apple ignores failed preference-file writes when Library/Preferences is absent.
+    if not persistent:return subprocess.CompletedProcess(args,0,b'',b'')
     values=args[args.index('-s')+1:]
     # SecKeychainSetDomainDefault calls Keychain::optional(NULL): current default,
     # not absence. Reproduce that Apple behavior rather than inventing an unset.
@@ -76,8 +78,10 @@ class SyntheticSecurity:
     values=state[key] if key=='search' else ([] if state[key] is None else [state[key]])
     out=('    <NULL>\n' if key=='default' and state[key] is None else ''.join('    "'+x+'"\n' for x in values)).encode()
   elif verb=='create-keychain':
-   target=Path(args[-1]);target.write_bytes(b'SYNTHETIC-PUBLIC-CMS-CERTS-ONLY');state['search'].append(str(target))
-   if state['default'] is None:state['default']=str(target)
+   target=Path(args[-1]);target.write_bytes(b'SYNTHETIC-PUBLIC-CMS-CERTS-ONLY')
+   if persistent:
+    state['search'].append(str(target))
+    if state['default'] is None:state['default']=str(target)
    out=b''
   elif verb=='unlock-keychain':out=b''
   elif verb=='delete-keychain':
@@ -315,6 +319,23 @@ class SealedBoundaryTests(unittest.TestCase):
    original=controller.security_state({});controller.prepare_cms_keychain(private,env,cms)
    model.fail=lambda args,e:args[1:5]==['default-keychain','-d','user','-s'] and e.get('HOME')!=model.home
    self.assertFalse(controller.emergency_signing_cleanup(private,original,{},cms))
+ def test_missing_preferences_parent_reproduces_successful_but_unpersisted_setter(self):
+  private,env,model=self.security_fixture();target=str(private/'home/cms-bootstrap.keychain-db')
+  result=model(['/usr/bin/security','default-keychain','-d','user','-s',target],env=env)
+  self.assertEqual(result.returncode,0);self.assertIsNone(model.state(env)['default']);self.assertFalse((private/'home/Library/Preferences').exists())
+ def test_owned_preferences_hierarchy_exists_before_first_keychain_mutation(self):
+  private,env,model=self.security_fixture();cms={};normal=copy.deepcopy(model.normal)
+  def run(args,**kwargs):
+   if args[0]=='/usr/bin/security' and (args[1]=='create-keychain' or '-s' in args):
+    self.assertTrue((private/'home/Library/Preferences').is_dir());self.assertTrue((private/'home/Library/Keychains').is_dir())
+   return model(args,**kwargs)
+  with patch.object(controller.subprocess,'run',side_effect=run):
+   controller.prepare_cms_keychain(private,env,cms);self.assertTrue(controller.emergency_signing_cleanup(private,normal,{},cms))
+ def test_conflicting_private_library_file_is_preserved_and_stops_setup(self):
+  private,env,model=self.security_fixture();valuable=private/'home/Library';valuable.write_bytes(b'KEEP-CONFLICT');cms={}
+  with patch.object(controller.subprocess,'run',side_effect=model):
+   with self.assertRaises(ValueError):controller.prepare_cms_keychain(private,env,cms)
+  self.assertEqual(valuable.read_bytes(),b'KEEP-CONFLICT');self.assertFalse(model.calls);self.assertFalse(cms)
  def test_cms_roundtrip_checks_real_darwin_before_any_sealed_input(self):
   private,env,model=self.security_fixture();cms={}
   normal=controller.clean_public_environment(gh());env=normal|{'HOME':str(private/'home')}

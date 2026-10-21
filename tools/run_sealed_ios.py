@@ -171,6 +171,12 @@ def prepare_cms_keychain(private,env,state):
  """Give unchanged CMS verification a private default for public signer certs."""
  home=private/'home';no_links(home,private);need(home.is_dir() and env['HOME']==str(home))
  keychain=home/'cms-bootstrap.keychain-db';no_links(keychain,private);need(not keychain.exists() and not state)
+ # Security's preferences writer silently ignores a missing parent directory.
+ # These directories belong only to this newly created private HOME.
+ for rel in ['Library','Library/Preferences','Library/Keychains']:
+  parent=home/rel;no_links(parent,private)
+  if not parent.exists():parent.mkdir(mode=0o700)
+  need(parent.is_dir())
  # Capture before create: Security may make the first keychain default itself.
  state.update(before=security_state(env),environment=env.copy(),path=str(keychain),attempted=True)
  password=base64.b64encode(os.urandom(32)).decode()
@@ -178,7 +184,7 @@ def prepare_cms_keychain(private,env,state):
   for args in [['create-keychain','-p',password,str(keychain)],['unlock-keychain','-p',password,str(keychain)],['default-keychain','-d','user','-s',str(keychain)],['list-keychains','-d','user','-s',str(keychain),*state['before']['search']]]:
    p=subprocess.run(['/usr/bin/security',*args],env=env,capture_output=True,stdin=subprocess.DEVNULL,timeout=30);need(p.returncode==0)
   no_links(keychain,private);need(keychain.is_file())
-  need(security_state(env)=={'default':str(keychain),'search':[str(keychain),*state['before']['search']]})
+  actual=security_state(env);need(actual['default']==str(keychain),'cms_default_readback_mismatch');need(actual['search']==[str(keychain),*state['before']['search']],'cms_search_readback_mismatch')
  finally:password=None
 
 def emergency_signing_cleanup(private,original_state,env,cms=None):
