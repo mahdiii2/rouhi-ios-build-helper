@@ -83,17 +83,33 @@ def stop_process(p):
   # A dead/reaped leader does not prove its Gradle/compiler descendants exited.
   # This PGID is exclusively created by our start_new_session Popen below.
   def alive():
+   # Darwin can report EPERM for a group containing only an unreaped zombie.
+   # Reap only our child; leader exit never replaces probing its whole group.
+   p.poll()
    try:os.killpg(p.pid,0);return True
    except ProcessLookupError:return False
+   except PermissionError:
+    # Close exit-between-poll-and-probe once; persistent denial stays uncertain.
+    p.poll()
+    try:os.killpg(p.pid,0);return True
+    except ProcessLookupError:return False
   if alive():
    try:os.killpg(p.pid,signal.SIGTERM)
    except ProcessLookupError:pass
+   except PermissionError:
+    # The leader may exit after a positive probe but before the signal.
+    # Ignore denial only after proving the whole owned group is now absent.
+    if alive():raise
   deadline=time.monotonic()+15
   while alive() and time.monotonic()<deadline:
    p.poll();time.sleep(.1)
   if alive():
    try:os.killpg(p.pid,signal.SIGKILL)
    except ProcessLookupError:pass
+   except PermissionError:
+    # The leader may exit after a positive probe but before the signal.
+    # Ignore denial only after proving the whole owned group is now absent.
+    if alive():raise
   deadline=time.monotonic()+15
   while alive() and time.monotonic()<deadline:
    p.poll();time.sleep(.1)

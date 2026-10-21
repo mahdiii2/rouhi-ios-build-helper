@@ -171,6 +171,56 @@ class SealedBoundaryTests(unittest.TestCase):
    if sig==controller.signal.SIGTERM:live[0]=False
   with patch.object(controller.os,'name','posix'),patch.object(controller.os,'killpg',create=True,side_effect=killpg):controller.stop_process(p)
   self.assertIn(controller.signal.SIGTERM,calls);self.assertFalse(live[0])
+ def test_posix_zombie_leader_is_reaped_before_group_probe(self):
+  from unittest.mock import Mock
+  p=Mock();p.pid=456789;state={'terminated':False,'reaped':False};calls=[]
+  def poll():
+   if state['terminated']:state['reaped']=True;return 0
+   return None
+  def killpg(pid,sig):
+   self.assertEqual(pid,p.pid);calls.append(sig)
+   if state['reaped']:raise ProcessLookupError()
+   if state['terminated']:raise PermissionError('synthetic-Darwin-zombie-only-group')
+   if sig==controller.signal.SIGTERM:state['terminated']=True
+  p.poll.side_effect=poll;p.wait.return_value=0
+  with patch.object(controller.os,'name','posix'),patch.object(controller.os,'killpg',create=True,side_effect=killpg):controller.stop_process(p)
+  self.assertTrue(state['reaped']);self.assertIn(controller.signal.SIGTERM,calls);p.wait.assert_called_once()
+ def test_posix_exit_between_reap_poll_and_probe_gets_one_owned_recheck(self):
+  from unittest.mock import Mock
+  p=Mock();p.pid=456789;state={'zombie':False,'reaped':False};calls=[]
+  def poll():
+   if state['zombie']:state['reaped']=True;return 0
+   return None
+  def killpg(pid,sig):
+   self.assertEqual(pid,p.pid);calls.append(sig)
+   if state['reaped']:raise ProcessLookupError()
+   self.assertEqual(sig,0);state['zombie']=True;raise PermissionError('synthetic-exit-after-poll')
+  p.poll.side_effect=poll;p.wait.return_value=0
+  with patch.object(controller.os,'name','posix'),patch.object(controller.os,'killpg',create=True,side_effect=killpg):controller.stop_process(p)
+  self.assertTrue(state['reaped']);self.assertTrue(all(sig==0 for sig in calls));p.wait.assert_called_once()
+ def test_posix_persistent_permission_denial_never_claims_quiescence(self):
+  from unittest.mock import Mock
+  p=Mock();p.pid=456789;p.poll.return_value=0
+  with patch.object(controller.os,'name','posix'),patch.object(controller.os,'killpg',create=True,side_effect=PermissionError('synthetic-persistent-denial')) as probe:
+   with self.assertRaises(PermissionError):controller.stop_process(p)
+  self.assertEqual(probe.call_count,2);p.wait.assert_not_called()
+ def test_posix_signal_side_zombie_races_require_proven_group_absence(self):
+  from unittest.mock import Mock
+  for exiting_signal in [controller.signal.SIGTERM,getattr(controller.signal,'SIGKILL',9)]:
+   with self.subTest(signal=exiting_signal):
+    p=Mock();p.pid=456789;state={'zombie':False,'reaped':False};calls=[]
+    def poll():
+     if state['zombie']:state['reaped']=True;return 0
+     return None
+    def killpg(pid,sig):
+     self.assertEqual(pid,p.pid);calls.append(sig)
+     if state['reaped']:raise ProcessLookupError()
+     if state['zombie']:raise PermissionError('synthetic-zombie-only-group')
+     if sig==exiting_signal:state['zombie']=True;raise PermissionError('synthetic-exit-before-signal')
+    p.poll.side_effect=poll;p.wait.return_value=0
+    with patch.object(controller.signal,'SIGKILL',9,create=True),patch.object(controller.os,'name','posix'),patch.object(controller.os,'killpg',create=True,side_effect=killpg),patch.object(controller.time,'monotonic',side_effect=iter(range(0,256,16))),patch.object(controller.time,'sleep'):
+     controller.stop_process(p)
+    self.assertTrue(state['reaped']);self.assertIn(exiting_signal,calls);p.wait.assert_called_once()
  def test_security_restore_failure_is_not_claimed_clean(self):
   private=self.path('private');(private/'build-temp').mkdir(parents=True)
   with patch.object(controller.subprocess,'run',side_effect=OSError('synthetic-security-failure')):self.assertFalse(controller.emergency_signing_cleanup(private,[],{}))
