@@ -1,0 +1,86 @@
+name: Owner-only sealed iOS archive
+run-name: sealed-ios-${{ inputs.app }}-${{ inputs.sealed_input_sha256 }}
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        type: choice
+        required: true
+        options: [customer, driver]
+      reviewed_helper_sha:
+        type: string
+        required: true
+      sealed_input_sha256:
+        type: string
+        required: true
+      source_sha:
+        type: string
+        required: true
+      build_number:
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: sealed-ios-owner-build
+  cancel-in-progress: false
+jobs:
+  archive:
+    if: >-
+      github.repository == 'mahdiii2/rouhi-ios-build-helper' &&
+      github.repository_owner == 'mahdiii2' &&
+      github.actor == 'mahdiii2' &&
+      github.triggering_actor == 'mahdiii2' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.reviewed_helper_sha == github.sha &&
+      github.run_attempt == 1
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    environment: sealed-ios-${{ inputs.app }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=1 -Dorg.gradle.configuration-cache=false -Dorg.gradle.jvmargs="-Xmx6g -Dfile.encoding=UTF-8" -Xmx512m
+      PYTHONDONTWRITEBYTECODE: '1'
+      REVIEWED_HELPER_SHA: ${{ inputs.reviewed_helper_sha }}
+      SEALED_INPUT_SHA256: ${{ inputs.sealed_input_sha256 }}
+      REVIEWED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REVIEWED_BUILD_NUMBER: ${{ inputs.build_number }}
+      REVIEWED_ROLE: ${{ inputs.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.reviewed_helper_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          check-latest: false
+          cache: ''
+      - name: Install only hash-verified public encryption dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-macos.txt
+      - name: Select existing Java21
+        run: echo "JAVA_HOME=$(/usr/libexec/java_home -v21)" >> "$GITHUB_ENV"
+      - name: Check generic synthetic boundaries
+        run: python3 -B -m unittest discover -s tests -v
+      - name: Check actual source/run/toolchain and download only the exact allowed ciphertext
+        run: python3 -B tools/run_sealed_ios.py preflight
+      - name: Build privately and encrypt outputs; preserve all native guards
+        env:
+          SEALED_INPUT_PASSPHRASE: ${{ secrets.SEALED_INPUT_PASSPHRASE }}
+        run: python3 -B tools/run_sealed_ios.py build-and-seal
+      - name: Save ciphertext only
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sealed-ios-${{ inputs.app }}-${{ github.run_id }}
+          path: sealed-output/*.sealed
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
+          compression-level: 0
+      - name: Remove this exact run's encrypted staging after artifact save
+        if: ${{ always() }}
+        run: python3 -B tools/run_sealed_ios.py final-cleanup

@@ -1,0 +1,27 @@
+{
+  "schema": 2,
+  "configured": true,
+  "repository": "mahdiii2/rouhi-ios-build-helper",
+  "output_public_key_sha256": "633ede3f345114059b857c8a9bc436096147661d13b5636d623e81ef16be2983",
+  "free_artifact_budget_bytes": 209715200,
+  "inputs": {
+    "customer": {
+      "cipher_sha256": "12dfb5e84e4900869baa5b56b47565d3f6269f0a735421a93d1eeb67681f67e0",
+      "source_sha": "c36329281aadcdd947c7cd607cd7a5dbfc84f72b",
+      "manifest_sha256": "8efd39c6bb67b5d48801dd6c4c67058999fd8532be4938a8275a0f6c860bb57b",
+      "original_source_closure_sha256": "c9abd686d963af74f585b2ee87444ff10384e31d0d91dd47d7270006827b945b",
+      "build_number": "1",
+      "version": "1.0",
+      "max_ciphertext_output_bytes": 104857600
+    },
+    "driver": {
+      "cipher_sha256": "a038bca569576abf8e1a97bfa1976485f16151be435d5af5e004b87a55e1a93e",
+      "source_sha": "11893cd97f4a08e776a6c08f7731d84db15525fb",
+      "manifest_sha256": "46c24f2c38a4dcee101769170777485af4152d18d56a27f7f845cfaa58f40c2e",
+      "original_source_closure_sha256": "f072d4ef8448f551ee895575ec30d3a281397cf439a38b5bc51ae7bf7a65168b",
+      "build_number": "4",
+      "version": "1.0",
+      "max_ciphertext_output_bytes": 104857600
+    }
+  }
+}
